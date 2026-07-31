@@ -98,9 +98,30 @@ impl NetstackState {
         if POLL_COUNT.fetch_add(1, Ordering::Relaxed).is_multiple_of(500) {
             let mut tcp_count = 0u32;
             let mut udp_count = 0u32;
+            // Breakdown of TCP sockets by state. BUG-8: sockets climb into the
+            // thousands at 128 KB each; the state mix tells us *which* ones are
+            // stuck — half-open (Established with a vanished peer), sockets held
+            // in a closing handshake, or listeners — and therefore what an idle
+            // timeout has to target. Counted here because it is the only place
+            // that already walks the whole SocketSet each poll.
+            let mut tcp_listen = 0u32;
+            let mut tcp_syn = 0u32;
+            let mut tcp_estab = 0u32;
+            let mut tcp_closing = 0u32;
+            let mut tcp_closed = 0u32;
             for (_, socket) in self.sockets.iter() {
                 match socket {
-                    Socket::Tcp(_) => tcp_count += 1,
+                    Socket::Tcp(s) => {
+                        tcp_count += 1;
+                        match s.state() {
+                            tcp::State::Listen => tcp_listen += 1,
+                            tcp::State::SynSent | tcp::State::SynReceived => tcp_syn += 1,
+                            tcp::State::Established => tcp_estab += 1,
+                            tcp::State::Closed => tcp_closed += 1,
+                            // FinWait1/2, Closing, CloseWait, LastAck, TimeWait
+                            _ => tcp_closing += 1,
+                        }
+                    }
                     Socket::Udp(_) => udp_count += 1,
                     _ => {}
                 }
@@ -112,8 +133,11 @@ impl NetstackState {
                 .map(|pages| pages * 4096 / 1024 / 1024)
                 .unwrap_or(0);
             tracing::info!(
-                "[b{}] netstack: rss={}MB tcp={} udp={} rx_q={} tx_q={} wakers={}",
-                crate::BUILD_NUM, rss_mb, tcp_count, udp_count,
+                "[b{}] netstack: rss={}MB tcp={} (lst={} syn={} est={} clo={} dead={}) \
+                 udp={} rx_q={} tx_q={} wakers={}",
+                crate::BUILD_NUM, rss_mb, tcp_count,
+                tcp_listen, tcp_syn, tcp_estab, tcp_closing, tcp_closed,
+                udp_count,
                 self.device.rx_queue.len(), tx.len(),
                 wakers.len(),
             );
