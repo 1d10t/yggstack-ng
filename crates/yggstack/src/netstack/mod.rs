@@ -23,6 +23,15 @@ use yggdrasil::ipv6rwc::ReadWriteCloser;
 use self::device::YggDevice;
 use self::frag::FragReassembler;
 
+// ── Tunables ──────────────────────────────────────────────────────────────────
+
+/// How long to wait for a TCP handshake to reach ESTABLISHED before giving up.
+/// Each pending dial holds a socket with 64 KB rx + 64 KB tx buffers, so
+/// unbounded waits let unreachable destinations pin memory indefinitely.
+/// Generous enough for a slow mesh path over LTE, short enough that a burst of
+/// dead dials drains instead of accumulating.
+const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
 // ── Time helper ───────────────────────────────────────────────────────────────
 
 fn smoltcp_now() -> SmolInstant {
@@ -428,7 +437,22 @@ impl YggNetstack {
             poll_wakeup: self.poll_wakeup.clone(),
         };
 
-        stream.wait_connected().await?;
+        // Bound the handshake. Without this a peer that never answers our SYN
+        // leaves the socket in SynSent forever: wait_connected() parks on a
+        // waker, the task never returns, and the TcpStream — with its 64 KB rx
+        // + 64 KB tx buffers — is never dropped. Observed on the A32 as bursts
+        // of tcp=545 (syn=544), i.e. ~70 MB of buffers held by dead dials.
+        // On timeout `stream` is dropped here, and its Drop aborts the socket
+        // and removes it from the SocketSet.
+        match tokio::time::timeout(CONNECT_TIMEOUT, stream.wait_connected()).await {
+            Ok(r) => r?,
+            Err(_) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    format!("connect to {} timed out", remote),
+                ))
+            }
+        }
         Ok(stream)
     }
 
